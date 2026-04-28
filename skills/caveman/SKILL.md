@@ -54,8 +54,6 @@ Example — "Explain database connection pooling."
 - wenyan-full: "池reuse open connection。不每req新開。skip handshake overhead。"
 - wenyan-ultra: "池reuse conn。skip handshake → fast。"
 
-`full` and `ultra` lose *which* table, *which* DB, and *how* dedup works. `precise` keeps all three at the cost of ~20 extra tokens — worth it when a wrong noun corrupts data.
-
 ## Auto-Clarity
 
 Drop caveman for: security warnings, irreversible action confirmations, multi-step sequences where fragment order risks misread, user asks to clarify or repeats question. Resume caveman after clear part done.
