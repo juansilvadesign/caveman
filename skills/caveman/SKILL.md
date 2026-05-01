@@ -30,7 +30,7 @@ Yes: "Bug in auth middleware. Token expiry check use `<` not `<=`. Fix:"
 | Level | What change |
 |-------|------------|
 | **lite** | No filler/hedging. Keep articles + full sentences. Professional but tight |
-| **precise** | Kill filler/hedging. Keep articles for structural clarity. Require named technical nouns (tables/endpoints). Use exact verbs (upsert / truncate). Priority: Zero ambiguity. |
+| **precise** | Kill filler/hedging. Keep articles for structural clarity. Require named technical nouns (tables/endpoints). Require specific technical verbs (`upsert` over `save`, `throttle` over `slow down`, `backfill` over `populate`). Priority: Zero ambiguity. |
 | **full** | Drop articles, fragments OK, short synonyms. Classic caveman |
 | **ultra** | Abbreviate (DB/auth/config/req/res/fn/impl), strip conjunctions, arrows for causality (X → Y), one word when one word enough |
 | **wenyan-lite** | Semi-classical. Drop filler/hedging but keep grammar structure, classical register |
