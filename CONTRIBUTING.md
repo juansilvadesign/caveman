@@ -1,22 +1,48 @@
-# Contributing
+# Contributing to Caveman
 
-Improvements to the SKILL.md prompt are welcome — open a PR with before/after examples showing the change.
+Thanks for helping make the cave bigger. PRs are welcome: new compressors,
+integrations, agent recipes, bug fixes, docs.
 
-## How
+A new content-type compressor can add support for CSV, HTML, SQL dumps, notebook
+output, or OpenAPI specs. Each one makes Caveman
+useful to a whole new slice of payloads. Start from an existing one under
+`engine/` and copy its shape.
 
-1. Fork repo
-2. Edit `skills/caveman/SKILL.md` — this is the only copy you need to touch
-3. Open PR with:
-   - **Before:** what caveman say now
-   - **After:** what caveman say with change
-   - One sentence why change better
+## Sign your commits (DCO)
 
-> **Note:** `caveman/SKILL.md`, `plugins/caveman/skills/caveman/SKILL.md`, `.cursor/skills/caveman/SKILL.md`, and `caveman.skill` are auto-synced by CI after merge. Do not edit them directly.
-> 
-> **Note on compress skill:** If you are modifying the compress skill, edit `caveman-compress/SKILL.md` or `caveman-compress/scripts/`. CI will automatically sync these changes to `skills/compress/` and `plugins/caveman/skills/compress/`.
+This project uses the [Developer Certificate of Origin](https://developercertificate.org/).
+It's a one-line promise that you wrote the code (or have the right to contribute
+it). Add a sign-off to every commit:
 
-Small focused change > big rewrite. Caveman like simple.
+```bash
+git commit -s -m "your message"
+```
 
-## Ideas
+That appends a `Signed-off-by: Your Name <your@email>` trailer. No CLA, no forms.
 
-See [issues labeled `good first issue`](../../issues?q=label%3A%22good+first+issue%22) for starter tasks.
+## Licensing of contributions
+
+Whole repo is [Apache-2.0](LICENSE) (see [LICENSING.md](LICENSING.md)).
+Contributions are inbound = outbound: you license your change under the same
+Apache-2.0 terms. Simple.
+
+## Where changes land
+
+Open a pull request against this repository. A maintainer checks license scope,
+tests, generated artifacts, and security boundaries for affected directory.
+Profile-only changes follow narrower process in
+[`docs/CONTRIBUTING_PROFILES.md`](docs/CONTRIBUTING_PROFILES.md).
+
+Keep generated files in same pull request as their source and retain commit
+authorship and DCO sign-off.
+
+## Before you open a PR
+
+- Build and test the package you touched (`go test ./...`, `pnpm test`, or
+  `pytest`, depending on the directory).
+- Keep it byte-safe: compressors must round-trip or degrade gracefully. Never
+  silently corrupt a payload. On any parse problem, pass the bytes through
+  untouched.
+- Match the surrounding style. Small, focused PRs review fastest.
+
+Questions → open a discussion or ping us at **hello@caveman.so**.
