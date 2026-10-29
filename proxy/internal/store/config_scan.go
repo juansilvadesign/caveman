@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	enginetokens "github.com/JuliusBrussee/caveman/engine/tokens"
 )
 
@@ -54,7 +56,9 @@ type mcpScopeScan struct {
 // Agent roots resolve local transcript/config dirs and stay env-overridable so
 // tests never read or write a user's real agent data. After the CAVEMAN_*
 // test overrides come the agents' own relocation variables: CLAUDE_CONFIG_DIR
-// moves Claude Code's whole config dir, CODEX_HOME moves Codex's.
+// moves Claude Code's whole config dir, CODEX_HOME moves Codex's,
+// PI_CODING_AGENT_DIR moves Pi's agent dir and PI_CODING_AGENT_SESSION_DIR moves
+// Pi's session storage.
 func claudeRoot() string {
 	if r := os.Getenv("CAVEMAN_CLAUDE_ROOT"); r != "" {
 		return r
@@ -125,6 +129,59 @@ func opencodeRoot() string {
 // Keep this source disabled unless the caller explicitly supplies a scan root.
 func aiderRoot() string {
 	return os.Getenv("CAVEMAN_AIDER_ROOT")
+}
+
+func piRoot() string {
+	if r := os.Getenv("CAVEMAN_PI_ROOT"); r != "" {
+		return r
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".pi")
+}
+
+// piRoots resolves where Pi keeps its session JSONL trees. The returned root is
+// the base rel_path is taken against; dir is the directory that actually holds
+// the trees. Pi reads PI_CODING_AGENT_DIR as its agent directory and
+// PI_CODING_AGENT_SESSION_DIR as an outright override of where sessions are
+// stored, both tilde-expanded (config.js getAgentDir/getSessionsDir ->
+// expandTildePath); without either it writes to <agent dir>/sessions, whose
+// default is <pi root>/agent/sessions. CAVEMAN_PI_ROOT keeps top precedence so
+// tests and tooling isolate the source, the same ordering the sibling roots use.
+func piRoots() (root, dir string) {
+	if r := os.Getenv("CAVEMAN_PI_ROOT"); r != "" {
+		return r, filepath.Join(r, "agent", "sessions")
+	}
+	if d := expandTilde(os.Getenv("PI_CODING_AGENT_SESSION_DIR")); d != "" {
+		return d, d
+	}
+	if d := expandTilde(os.Getenv("PI_CODING_AGENT_DIR")); d != "" {
+		return d, filepath.Join(d, "sessions")
+	}
+	root = piRoot()
+	if root == "" {
+		return "", ""
+	}
+	return root, filepath.Join(root, "agent", "sessions")
+}
+
+// expandTilde mirrors Pi's expandTildePath (normalizePath with its default
+// options): a bare "~" and a leading "~/" (or "~\\" on Windows) expand to the
+// home directory, anything else is returned unchanged.
+func expandTilde(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, `~\`) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
 }
 
 // estimateTokens is the project's inferred token heuristic (bytes/4), matching the
@@ -352,7 +409,13 @@ func scanSkills(skillsDir string) []skillInfo {
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		name, desc := readSkillFrontmatter(path)
+		fm := readSkillFrontmatter(path)
+		if fm.DisableModelInvocation {
+			// Claude Code leaves these out of the per-turn catalog; they load only
+			// when the user invokes them.
+			continue
+		}
+		name, desc := fm.Name, fm.Description
 		if name == "" {
 			name = e.Name()
 		}
@@ -375,16 +438,24 @@ func metadataWithTokenBasis(raw, basis string) string {
 	return compactMeta(meta)
 }
 
-func readSkillFrontmatter(path string) (name, desc string) {
+// skillFrontmatter holds the SKILL.md keys that decide a skill's catalog tax.
+type skillFrontmatter struct {
+	Name                   string `yaml:"name"`
+	Description            string `yaml:"description"`
+	DisableModelInvocation bool   `yaml:"disable-model-invocation"`
+}
+
+func readSkillFrontmatter(path string) skillFrontmatter {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", ""
+		return skillFrontmatter{}
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	inFront := false
 	started := false
+	var front []string
 	for sc.Scan() {
 		line := sc.Text()
 		trimmed := strings.TrimSpace(line)
@@ -400,19 +471,34 @@ func readSkillFrontmatter(path string) (name, desc string) {
 			if !started {
 				// No frontmatter fence on the first non-empty line; bail.
 				if trimmed != "" {
-					return "", ""
+					return skillFrontmatter{}
 				}
 				continue
 			}
 			continue
 		}
+		front = append(front, line)
+	}
+	var fm skillFrontmatter
+	if err := yaml.Unmarshal([]byte(strings.Join(front, "\n")), &fm); err == nil {
+		fm.Name, fm.Description = strings.TrimSpace(fm.Name), strings.TrimSpace(fm.Description)
+		return fm
+	}
+	// Hand-written frontmatter is often not strict YAML (e.g. an unquoted ": " in
+	// a description); fall back to reading single-line keys.
+	fm = skillFrontmatter{}
+	for _, line := range front {
+		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "name:") {
-			name = strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
+			fm.Name = strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
 		} else if strings.HasPrefix(trimmed, "description:") {
-			desc = strings.TrimSpace(strings.TrimPrefix(trimmed, "description:"))
+			fm.Description = strings.TrimSpace(strings.TrimPrefix(trimmed, "description:"))
+		} else if trimmed == "disable-model-invocation: true" {
+			fm.DisableModelInvocation = true
 		}
 	}
-	return strings.Trim(name, `"'`), strings.Trim(desc, `"'`)
+	fm.Name, fm.Description = strings.Trim(fm.Name, `"'`), strings.Trim(fm.Description, `"'`)
+	return fm
 }
 
 func countHooks(settingsPath string) int {

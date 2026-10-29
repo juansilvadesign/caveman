@@ -118,6 +118,10 @@ export default function (pi: ExtensionAPI) {
   let pendingContext: string[] = [];
   let pendingBytes = 0;
   let gateDone = false;
+  // Set while the runtime answers hooks, so a PostToolUse that gets nothing is
+  // read as the runtime going quiet rather than as "no replacement this time".
+  let runtimeReachable = false;
+  let warnedNoReply = false;
 
   const notify = (ctx: ExtensionContext | undefined, message: string, kind: "warning" | "info") => {
     if (ctx?.hasUI) ctx.ui.notify(message, kind);
@@ -161,7 +165,7 @@ export default function (pi: ExtensionAPI) {
     description: "Recover exact original content from a Caveman recovery handle.",
     parameters: Type.Object({
       recovery_handle: Type.String({ description: "Exact ccr_ handle returned by Caveman or copied from a <<ccr:HANDLE>> marker." }),
-      query: Type.Optional(Type.String({ description: "One broad description covering every detail needed from this handle." })),
+      query: Type.Optional(Type.String({ description: "Optional. Omit it to get the entire original. With it, only a matching excerpt is returned, with gaps marked. Use one broad description covering every detail needed." })),
     }),
     async execute(_toolCallId, params, signal) {
       const result = await recovery.retrieve(params.recovery_handle, params.query, signal);
@@ -178,6 +182,8 @@ export default function (pi: ExtensionAPI) {
     coreContext = undefined;
     pendingContext = [];
     pendingBytes = 0;
+    runtimeReachable = false;
+    warnedNoReply = false;
     // A failed gate in a replacement session must not retain the old route.
     if (!(await router.closeGate(ctx))) {
       gateDone = true;
@@ -190,6 +196,7 @@ export default function (pi: ExtensionAPI) {
     }
     const start = await bridge.call("SessionStart", { session_id: sessionId });
     coreContext = additionalContextOf(start);
+    runtimeReachable = start !== undefined;
     if (!start) {
       // No native runtime reachable means no Core and no lifecycle decisions;
       // routing without them would be compression theater.
@@ -243,10 +250,14 @@ export default function (pi: ExtensionAPI) {
     pendingContext = [];
     pendingBytes = 0;
     if (!coreContext && dynamic.length === 0) return undefined;
-    // Core is appended byte-stably every turn (prefix caching); dynamic context
-    // rides only the turn it arrived on.
-    const parts = [event.systemPrompt, coreContext, ...dynamic].filter(Boolean) as string[];
-    return { systemPrompt: parts.join("\n\n") };
+    // Core is appended byte-stably every turn (prefix caching). Dynamic context
+    // changes per prompt, so it rides a hidden message at the tail of this run
+    // instead: in the system prompt it would rewrite the provider's prompt cache
+    // from the system prompt onward, twice per prompt (#1364).
+    const result: { systemPrompt?: string; message?: { customType: string; content: string; display: boolean } } = {};
+    if (coreContext) result.systemPrompt = [event.systemPrompt, coreContext].filter(Boolean).join("\n\n");
+    if (dynamic.length > 0) result.message = { customType: "caveman-context", content: dynamic.join("\n\n"), display: false };
+    return result;
   }));
 
   pi.on("turn_start", GUARD_turn_start(() => { void bridge.call("ModelBefore", { session_id: sessionId }); }));
@@ -274,7 +285,7 @@ export default function (pi: ExtensionAPI) {
 
   // caveman_retrieve's own output is the recovered ORIGINAL. Shrinking it hands
   // the model a fresh ccr:// mask (the proxy's classifyTool files it as an
-  // ObjectCommandResult and masks anything past ~448 bytes), so recovery loops
+  // ObjectCommandResult and masks anything past ~4 KB), so recovery loops
   // instead of terminating — and registering this tool disabled the proxy's
   // server-side retrieve loop, so nothing else would strip it.
   // A shrink hands the model a ccr:// handle plus an instruction to call
@@ -307,8 +318,19 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
-  pi.on("tool_result", GUARD_tool_result((event: Parameters<typeof shrinkToolResult>[2]) =>
-    event.toolName === RECOVERY_TOOL || !recoveryCallable() ? undefined : shrinkToolResult(bridge, sessionId, event, recovery)));
+  pi.on("tool_result", GUARD_tool_result((event: Parameters<typeof shrinkToolResult>[2], ctx: ExtensionContext) =>
+    event.toolName === RECOVERY_TOOL || !recoveryCallable() ? undefined : shrinkToolResult(bridge, sessionId, event, recovery, () => {
+      // The runtime answered SessionStart and then stopped answering, so
+      // shrinking has silently stopped for the rest of the session: the user
+      // pays full token cost with nothing to show for it (#1287). Say so once.
+      // A session that never reached a runtime already got the "native runtime
+      // unreachable" notice above, so gate on reachable to avoid saying it twice.
+      // One empty reply can also just be a hook that outran HOOK_TIMEOUT_MS, and
+      // every later result is still attempted, so hedge rather than assert.
+      if (!runtimeReachable || warnedNoReply) return;
+      warnedNoReply = true;
+      notify(ctx, "Caveman: tool-output shrinking may be off this session (the native runtime gave no reply)", "warning");
+    })));
 
   pi.on("session_before_compact", GUARD_session_before_compact(() => { void bridge.call("PreCompact", { session_id: sessionId }); }));
 

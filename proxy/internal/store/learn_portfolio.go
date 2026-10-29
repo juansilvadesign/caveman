@@ -46,6 +46,7 @@ func learnSessionSources() []sessionSource {
 		codexSessionSource{root: codexRoot()},
 		geminiSessionSource{root: geminiRoot()},
 		opencodeSessionSource{root: opencodeRoot()},
+		newPiSessionSource(),
 		aiderSessionSource{root: aiderRoot()},
 	}
 }

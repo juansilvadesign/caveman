@@ -123,10 +123,13 @@ const wrapTempDirs = new Set<string>();
 const PROXY_ADDR = "127.0.0.1:8787";
 const PROXY_URL = `http://${PROXY_ADDR}`;
 // Restores Claude Code's tool search after we take over ANTHROPIC_BASE_URL.
-// "auto" defers to Claude Code's own tool-catalog size threshold, so a user with
-// two small MCP servers pays no extra round-trip while a heavy setup stops
-// inlining every schema. "true" would force it on regardless.
-const TOOL_SEARCH_DEFAULT = "auto";
+// "true" matches Claude Code's own default when the variable is unset. "auto"
+// would gate it on a tool-catalog size threshold, which hosts that connect MCP
+// servers after the first request (Agent SDK apps) cross mid-session: early
+// turns inline every schema and the flip to deferred busts the prompt cache.
+const TOOL_SEARCH_DEFAULT = "true";
+// Earlier releases wrote "auto"; disable still withdraws it as ours.
+const LEGACY_TOOL_SEARCH_DEFAULTS = ["auto"];
 
 // The agent traffic target (wrap, `enable <agent>`, module wiring), resolved per
 // invocation. Signing in never moves agent traffic through a Caveman hop: the
@@ -7844,6 +7847,37 @@ export function hookExecutableInvocation(
   return platform === "win32" && powershell ? `& ${invocation}` : invocation;
 }
 
+// hostShellInvocation renders the same invocation for a command string we hand
+// BACK to the host for the host's own shell to run — a `shrink` rewrite, not a
+// hook the host dispatches itself. That shell differs per host on Windows: Git
+// Bash under Claude Code, PowerShell under the opencode plugin, cmd.exe under
+// Gemini CLI, and the three share no quoting syntax. A quoted path is only a
+// string literal in PowerShell, so the quoted prefix died with
+// `ParserError: Unexpected token 'shrink'` before the command ran (#1263);
+// single quotes are literal characters in cmd.exe; and the `&` call operator
+// PowerShell needs is a syntax error in bash. An unquoted, forward-slashed path
+// is the one form all three execute, so emit that when every component allows
+// it and return null when one does not — a path with a space has no portable
+// form at all, and the caller then declines the rewrite, which leaves the
+// command running exactly as the host sent it. POSIX hosts all run an sh-family
+// shell, where the quoted form is both correct and space-safe: unchanged there.
+const BARE_HOST_SHELL_PATH = /^[A-Za-z0-9_:./-]+$/;
+export function hostShellInvocation(
+  executable: string,
+  script: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const parts = script ? [executable, script] : [executable];
+  if (platform !== "win32") return parts.map((part) => quoteHookPath(part, platform)).join(" ");
+  const bare: string[] = [];
+  for (const part of parts) {
+    const normalized = normalizeHookPath(part, platform);
+    if (!BARE_HOST_SHELL_PATH.test(normalized)) return null;
+    bare.push(normalized);
+  }
+  return bare.join(" ");
+}
+
 function nativeHookCommand(agentId: string): string {
   const fastHook = join(dirname(fileURLToPath(import.meta.url)), "native-hook-fast.js");
   const explicitProxy = process.env.CAVEMAN_PROXY_BIN;
@@ -8131,6 +8165,33 @@ function generatedInvocation(text: string): string[] | undefined {
 function generatedArtifactTargetsExist(text: string): boolean {
   const tokens = generatedInvocation(text);
   return tokens === undefined || invocationTargetsExist(tokens);
+}
+
+// Same question as managedHookTargetsExist below, asked of an MCP registration
+// instead of a hook: the recovery tool is only real while the command the host
+// will launch still exists and can be executed. probeMcpBinary() answers a
+// DIFFERENT question — whether some compatible caveman-mcp is resolvable on
+// this machine right now — so an install whose registered binary was removed,
+// or left non-executable, kept attesting recovery while an actual launch raised
+// FileNotFoundError or PermissionError (#1392). That is the MCP twin of the
+// disappearing hook/plugin targets in #1137.
+//
+// Existence and permission only: a registration may have been edited by the
+// user, and probing it must never run it, nor adopt it as owned. Registrations
+// journaled as config text (codex tables, the hermes mcp_servers block) carry
+// no structured command and are not inspected here.
+function journaledMcpTargetsExist(journal: NativeJournal | null | undefined): boolean {
+  for (const operation of journal?.operations ?? []) {
+    const installed = operation.owned?.installed_mcp;
+    if (!installed || typeof installed !== "object" || Array.isArray(installed)) continue;
+    const { command, args } = installed as { command?: unknown; args?: unknown };
+    const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    // claude: { command: "<bin>", args: [] } · gemini: { command, args }
+    // opencode: { type: "local", command: ["<bin>"] }
+    const tokens = Array.isArray(command) ? strings(command) : typeof command === "string" ? [command, ...strings(args)] : [];
+    if (tokens.length > 0 && !invocationTargetsExist(tokens)) return false;
+  }
+  return true;
 }
 
 // A managed hook is only healthy while the files its command runs still exist.
@@ -8566,8 +8627,17 @@ type NativeHostProbe = { binary: string | null; launchable: boolean; version: st
 const nativeHostProbes = new Map<string, NativeHostProbe>();
 
 function nativeHostProbe(agent: AgentProfile): NativeHostProbe {
-  const binary = which(binOf(agent));
-  if (!binary) return { binary: null, launchable: false, version: null, error: "binary_not_found" };
+  return nativeBinaryProbe(binOf(agent))
+    ?? { binary: null, launchable: false, version: null, error: "binary_not_found" };
+}
+
+// One named binary, or null when it is not installed — so a caller that cares
+// about EVERY published name (opencodePluginMajors) can ask per name instead of
+// only about binOf's first hit. Shares the probe cache, keyed on the resolved
+// path, so two names resolving to the same file cost one spawn.
+function nativeBinaryProbe(name: string): NativeHostProbe | null {
+  const binary = which(name);
+  if (!binary) return null;
   let probe = nativeHostProbes.get(binary);
   if (!probe) nativeHostProbes.set(binary, probe = probeNativeHost(binary));
   return probe;
@@ -8971,12 +9041,28 @@ function opencodeNativePluginPath(): string {
   return join(opencodeConfigDir(), "plugins", "caveman-native.js");
 }
 
-function opencodePluginMajor(): number | null {
+// The plugin APIs this machine has to satisfy, ascending and deduplicated.
+//
+// Asking which major "the" host is was the wrong question: the generated plugin
+// lives at ONE path every opencode on the machine reads, and @opencode/cli
+// publishes `opencode` and `opencode2` from the same package, so two majors run
+// side by side routinely. A 1.x kept on PATH for other projects won binOf's
+// first-found probe, the gate read major 1, and OpenCode 2 refused the V1 hook
+// map outright: PluginModule.LoadError, missing "default" (#1316).
+//
+// Empty means no installed binary named a readable version — evidence of
+// neither major, not of absence.
+function opencodePluginMajors(): number[] {
   const profile = AGENTS.find((agent) => agent.id === "opencode");
-  const host = profile ? nativeHostProbe(profile) : null;
-  // A failed probe's text is its error output, not a version.
-  const semver = host?.launchable ? parsedSemver(host.version) : undefined;
-  return semver ? semver[0]! : null;
+  if (!profile) return [];
+  const majors = new Set<number>();
+  for (const name of profile.binary_names) {
+    const probe = nativeBinaryProbe(name);
+    // A failed probe's text is its error output, not a version.
+    const semver = probe?.launchable ? parsedSemver(probe.version) : undefined;
+    if (semver) majors.add(semver[0]!);
+  }
+  return [...majors].sort((a, b) => a - b);
 }
 
 function opencodeNativePluginSource(): string {
@@ -8990,10 +9076,13 @@ function opencodeNativePluginSource(): string {
   // V2 { id, setup } beside it. 1.x also calls setup, with a context that has
   // no session or event API, so setup returns there. Checked against real
   // OpenCode 1.18.35 and 2.0.22; 1.0-1.3 call every export and cannot load it.
-  const major = opencodePluginMajor();
-  if (major === null) return opencodeNativePluginSourceBoth();
-  if (major < 2) return opencodeNativePluginSourceV1();
-  return opencodeNativePluginSourceV2();
+  //
+  // Two installed majors take that same file, for the same reason: they share
+  // this one plugins directory, so a file pinned to either API is one the other
+  // host refuses to load (#1316).
+  const majors = opencodePluginMajors();
+  if (majors.length !== 1) return opencodeNativePluginSourceBoth();
+  return majors[0]! < 2 ? opencodeNativePluginSourceV1() : opencodeNativePluginSourceV2();
 }
 
 function opencodeNativePluginSourceBoth(): string {
@@ -10098,6 +10187,20 @@ function insertHermesNativeListEntry(
   return whole.join("\n");
 }
 
+// Hermes provider ids that carry their OWN OAuth credential and the ChatGPT
+// Responses transport. Rewriting one to the generic `custom` provider drops
+// both: the installed resolver then picks chat_completions with
+// `no-key-required` and every request 401s (#1391). These keep their provider
+// and ride the proxy's existing ChatGPT handler instead.
+const HERMES_CHATGPT_OAUTH_PROVIDERS = new Set(["openai-codex"]);
+
+// `/chatgpt` is the ChatGPT mux handler, which takes its suffix verbatim — the
+// Responses operation is `/chatgpt/responses`, so this must NOT gain a "/v1".
+// Same reasoning as codexGatewayBase().
+function hermesGatewayBase(gw: string, keptProvider: string | null): string {
+  return appendUrlPath(gw, keptProvider && HERMES_CHATGPT_OAUTH_PROVIDERS.has(keptProvider) ? "/chatgpt" : "/w/hermes/v1");
+}
+
 function hermesNativeConfig(source: string, gw: string, mcpBinary: string): { text: string; owned: Record<string, unknown> } {
   for (const marker of [HERMES_NATIVE_ROUTE_BEGIN, HERMES_NATIVE_ROUTE_END, HERMES_NATIVE_PLUGIN_BEGIN, HERMES_NATIVE_PLUGIN_END, HERMES_NATIVE_MCP_BEGIN, HERMES_NATIVE_MCP_END]) {
     if (source.includes(marker)) throw new Error("existing Hermes Caveman native block is unjournaled; run `caveman doctor hermes`");
@@ -10121,10 +10224,17 @@ function hermesNativeConfig(source: string, gw: string, mcpBinary: string): { te
   }
   const insertAt = routeIndexes[0] ?? model.start + 1;
   for (const index of [...routeIndexes].sort((a, b) => b - a)) lines.splice(index, 1);
+  // A named OAuth provider selects a credential and a transport that the
+  // generic custom route cannot carry, so keep it and route to the handler
+  // that speaks it. `api_mode` is not a route key, so it already survives.
+  const providerLine = previousRouteLines.find((line) => /^  provider:/.test(line));
+  const previousProvider = providerLine ? configValue(providerLine.slice(providerLine.indexOf(":") + 1)) : undefined;
+  const keptProvider = previousProvider && HERMES_CHATGPT_OAUTH_PROVIDERS.has(previousProvider) ? previousProvider : null;
+  const route = hermesGatewayBase(gw, keptProvider);
   const routeBlock = [
     `  ${HERMES_NATIVE_ROUTE_BEGIN}`,
-    '  provider: "custom"',
-    `  base_url: ${yamlQuote(appendUrlPath(gw, "/w/hermes/v1"))}`,
+    keptProvider ? `  provider: ${keptProvider}` : '  provider: "custom"',
+    `  base_url: ${yamlQuote(route)}`,
     `  ${HERMES_NATIVE_ROUTE_END}`,
   ];
   lines.splice(insertAt, 0, ...routeBlock);
@@ -10166,7 +10276,10 @@ function hermesNativeConfig(source: string, gw: string, mcpBinary: string): { te
   return {
     text: yamlText(lines),
     owned: {
-      route: appendUrlPath(gw, "/w/hermes/v1"),
+      route,
+      // Absent in journals written before #1391; doctor reads that as the
+      // generic route, which is what those installs actually carry.
+      provider: keptProvider ?? "custom",
       route_block: routeBlock.join("\n"),
       previous_route_lines: previousRouteLines,
       plugin_block: pluginBlock,
@@ -10766,7 +10879,7 @@ function restoreNativeOperation(operation: NativeJournal["operations"][number]):
     // Symmetric to the enable-side ENABLE_TOOL_SEARCH write: only withdraw the
     // value we introduced ourselves and only while it is still untouched, so a
     // user who set their own afterwards keeps it.
-    if (beforeEnv.ENABLE_TOOL_SEARCH === undefined && currentEnv.ENABLE_TOOL_SEARCH === TOOL_SEARCH_DEFAULT) {
+    if (beforeEnv.ENABLE_TOOL_SEARCH === undefined && (currentEnv.ENABLE_TOOL_SEARCH === TOOL_SEARCH_DEFAULT || LEGACY_TOOL_SEARCH_DEFAULTS.includes(String(currentEnv.ENABLE_TOOL_SEARCH)))) {
       delete currentEnv.ENABLE_TOOL_SEARCH;
     }
     // Auto's picker keys this enable added, each only while it is still ours.
@@ -11351,11 +11464,16 @@ function nativeIntegrationStatus(agent: NativeAgent, { probe = true }: { probe?:
   const coreResolution = runtimeConfig.resolution.values["think.core"];
   const coreConfigured = coreResolution.value === true;
   const mcp = probeMcpBinary();
-  const expectedRoute = agent === "codex"
-    ? codexGatewayBase(gatewayURL(), detectCodexWrapAuthMode() === "subscription")
-    : appendUrlPath(gatewayURL(), agent === "claude" ? "/w/claude" : agent === "hermes" ? "/w/hermes/v1" : agent === "gemini" ? "/w/gemini" : agent === "pi" ? "/w/pi" : "/w/aider/openai/v1");
   const routeKind: NativeMutation["kind"] = agent === "claude" ? "claude-settings" : agent === "codex" ? "codex-config" : agent === "hermes" ? "hermes-config" : agent === "gemini" ? "gemini-env" : agent === "opencode" ? "opencode-config" : agent === "pi" ? "pi-extension" : "aider-config";
   const routeOperation = journal?.operations.find((operation) => operation.kind === routeKind);
+  // Hermes has two routes: the generic one, and `/chatgpt` for an install that
+  // kept a named OAuth provider. The journal records which, so doctor expects
+  // the route this install actually wrote rather than one of them always.
+  const expectedRoute = agent === "codex"
+    ? codexGatewayBase(gatewayURL(), detectCodexWrapAuthMode() === "subscription")
+    : agent === "hermes"
+      ? hermesGatewayBase(gatewayURL(), typeof routeOperation?.owned?.provider === "string" ? routeOperation.owned.provider : null)
+      : appendUrlPath(gatewayURL(), agent === "claude" ? "/w/claude" : agent === "gemini" ? "/w/gemini" : agent === "pi" ? "/w/pi" : "/w/aider/openai/v1");
   // Pi's artifact encodes no route: the extension resolves the gateway at
   // runtime through the same env → config → default chain as gatewayURL(), so
   // route drift between enable and now cannot happen. What CAN drift is the
@@ -11383,23 +11501,34 @@ function nativeIntegrationStatus(agent: NativeAgent, { probe = true }: { probe?:
   // An unreadable version cannot vouch for a single-API file (an old V1 install
   // on a 2.x host whose probe times out); repair rewrites it as the file both
   // majors load, which reads current whatever the version.
+  //
+  // Neither can ONE readable version when the machine has two of them: the same
+  // drift arrives sideways when a second bin shows up rather than when the first
+  // one upgrades (`opencode` stays 1.19.3, `opencode2` is new, and the shared
+  // plugins dir now has a host that refuses the installed file — #1316). So the
+  // question is the full set of installed majors, exactly as it is for emission.
   const opencodePluginApiCurrent = agent !== "opencode" || (() => {
     const operation = journal?.operations.find((item) => item.kind === "opencode-plugin");
     const current = operation ? fileBytes(operation.file)?.toString("utf8") : null;
     if (!current) return true;
     const installedV2 = current.includes("async setup(ctx)");
     const installedV1 = current.includes("export const CavemanNative");
+    // Both markers (the dual file) or neither: nothing is pinned to one API.
     if (installedV1 === installedV2) return true;
-    const semver = host.launchable ? parsedSemver(host.version) : undefined;
-    if (!semver) return false;
-    return (semver[0]! >= 2) === installedV2;
+    const majors = opencodePluginMajors();
+    if (majors.length !== 1) return false;
+    return (majors[0]! >= 2) === installedV2;
   })();
   const routeHealthy = ownedHealthy && (agent === "opencode"
     ? Object.entries(opencodeNativeRoutes(gatewayURL())).every(([providerID, route]) => (routeOperation?.owned?.routes as Record<string, unknown> | undefined)?.[providerID] === route)
     // Claude journals one route per profile; each has to be the current one.
     : agent === "pi" ? piBundleCurrent : Boolean(routeOperation) && journal!.operations.every((operation) => operation.kind !== routeKind || operation.owned?.route === expectedRoute));
   const proxyHealthy = wrapMode(gatewayURL()) === "managed" || Boolean(probeProxyVersion()?.capabilities.includes("native_runtime_v1"));
-  const recoveryHealthy = agent === "aider" || Boolean(mcp?.probe.current);
+  // Recovery is real only when a current caveman-mcp is resolvable AND the
+  // command the host will actually launch still exists. Both the component
+  // below and this verdict read the one term, so they cannot disagree.
+  const mcpLaunchable = Boolean(mcp?.probe.current) && journaledMcpTargetsExist(journal);
+  const recoveryHealthy = agent === "aider" || mcpLaunchable;
   const state = !available ? "unavailable" : transactionPending ? "degraded" : !installed ? "available" : !packCurrent || !ownedHealthy || !routeHealthy || !proxyHealthy || !recoveryHealthy || !opencodePluginApiCurrent || unwiredProfiles.length > 0 ? "degraded" : "installed";
 	const coreSupported = agent === "aider" ? ownedHealthy : ownedHealthy && Boolean(NATIVE_PACK.core);
   // Codex runs none of the hooks until the user trusts them; Core rides on them.
@@ -11434,7 +11563,7 @@ function nativeIntegrationStatus(agent: NativeAgent, { probe = true }: { probe?:
     // A plugin the host cannot load runs no hooks, whatever its bytes hash to.
     lifecycle_hooks: agent !== "aider" && ownedHealthy && opencodePluginApiCurrent && hooksTrusted,
     core: coreActive,
-    mcp_recovery: agent !== "aider" && ownedHealthy && Boolean(mcp?.probe.current),
+    mcp_recovery: agent !== "aider" && ownedHealthy && mcpLaunchable,
     // Codex is false for the same reason hermes is: no command rewrite happens.
     // Since #1037 shrinkHook declines every Codex tool event, so Codex gets no
     // shrink-hook entry; an older install's entry reads degraded until --fix.
@@ -16655,12 +16784,14 @@ function shouldShrink(command: string): boolean {
   return SHRINK_ALLOW.has(first);
 }
 
-// cavemanBinForHook is the invocation a Claude hook uses to call back into this
-// CLI, robust to PATH: a resolved `caveman`/`cave`, else this very script's node.
-function cavemanBinForHook(powershell: boolean = process.platform === "win32"): string {
+// cavemanHookTarget resolves what a hook runs to call back into this CLI, robust
+// to PATH: a resolved `caveman`/`cave`, else this very script's node. Rendering it
+// into a command string is the caller's job, because the two callers target
+// different shells (see hookExecutableInvocation vs hostShellInvocation).
+function cavemanHookTarget(): { executable: string; script?: string } {
   // Never a package runner's cached copy when a lasting one exists.
   const command = durableCaveman() ?? which("caveman") ?? which("cave");
-  if (!command) return hookExecutableInvocation(stableNodePath(), process.argv[1]!, process.platform, powershell);
+  if (!command) return { executable: stableNodePath(), script: process.argv[1]! };
   // npm links `caveman` to a `#!/usr/bin/env node` script, and a host started
   // from a GUI or launchd often has no node on PATH (nvm, volta, Homebrew):
   // run it with this node, named as the lifecycle hooks name theirs (`--node`)
@@ -16670,9 +16801,22 @@ function cavemanBinForHook(powershell: boolean = process.platform === "win32"): 
   try {
     script = hookCommandBasename(process.execPath) === "node" && /\.[cm]?js$/.test(realpathSync(command));
   } catch { /* unresolvable: run it as found */ }
-  return script
-    ? hookExecutableInvocation(stableNodePath(), command, process.platform, powershell)
-    : hookExecutableInvocation(command, undefined, process.platform, powershell);
+  return script ? { executable: stableNodePath(), script: command } : { executable: command };
+}
+
+// cavemanBinForHook is that invocation as the HOST will dispatch it — on native
+// Windows the hosts run command hooks through PowerShell, which needs `&`.
+function cavemanBinForHook(powershell: boolean = process.platform === "win32"): string {
+  const target = cavemanHookTarget();
+  return hookExecutableInvocation(target.executable, target.script, process.platform, powershell);
+}
+
+// cavemanBinForHostShell is that invocation for the host's OWN shell, which we do
+// not know. null = no portable form; the caller must decline rather than emit a
+// command one of the three Windows shells cannot parse (#1263).
+function cavemanBinForHostShell(): string | null {
+  const target = cavemanHookTarget();
+  return hostShellInvocation(target.executable, target.script, process.platform);
 }
 
 // shrinkHook is the settings-hook callback for the agents whose harness can
@@ -16706,9 +16850,15 @@ async function shrinkHook() {
   if (!isGemini && !isBash) process.exit(0);
   const command = evt.tool_input?.command;
   if (typeof command !== "string" || !shouldShrink(command)) process.exit(0);
-  // updatedInput.command executes in host shell (Git Bash on Claude Windows),
-  // not hook's explicit PowerShell shell. Never leak PowerShell `&` into it.
-  const rewritten = `${cavemanBinForHook(false)} shrink -- ${command.trim()}`;
+  // updatedInput.command executes in the host's own shell — Git Bash under Claude
+  // Code on Windows, PowerShell under the opencode plugin, cmd.exe under Gemini —
+  // never the hook's explicit PowerShell shell, so this prefix is rendered bare
+  // rather than quoted or `&`-prefixed. When no form serves all three (a space in
+  // the path), there is no rewrite: the command runs as the host sent it, which is
+  // the same safe direction as every other decline above.
+  const prefix = cavemanBinForHostShell();
+  if (!prefix) process.exit(0);
+  const rewritten = `${prefix} shrink -- ${command.trim()}`;
   // Gemini merges hookSpecificOutput.tool_input (snake_case, no event discriminator);
   // Claude REPLACES via hookSpecificOutput.updatedInput (camelCase + hookEventName).
   // Because Claude replaces, updatedInput must carry every field the host sent —
@@ -19011,7 +19161,7 @@ type LearnDiff = { days: number; gone: number; back: number; fresh: number };
 // older proxies omit it and always scanned 30d).
 function learnEmpty(plan: LearnPlan): string {
   const since = learnSince(plan.window?.since || "30d");
-  return `no Claude Code, Codex, Gemini CLI, opencode or aider sessions found in the last ${since}. A score needs the same text repeated in at least 3 sessions. Use your agent a few times (for example \`caveman claude\`), then run \`caveman learn\` again`;
+  return `no Claude Code, Codex, Gemini CLI, opencode, aider or Pi sessions found in the last ${since}. A score needs the same text repeated in at least 3 sessions. Use your agent a few times (for example \`caveman claude\`), then run \`caveman learn\` again`;
 }
 
 // learnNoScoreYet explains why there is no score: the score needs the same
@@ -19237,6 +19387,7 @@ function learnSourceLine(plan: LearnPlan, sessions: number): string {
     by.gemini ? `Gemini ${commaCount(by.gemini)}` : "",
     by.opencode ? `opencode ${commaCount(by.opencode)}` : "",
     by.aider ? `aider ${commaCount(by.aider)}` : "",
+    by.pi ? `Pi ${commaCount(by.pi)}` : "",
   ].filter(Boolean);
   return `${commaCount(sessions)} sessions read${sourceBits.length ? ` · ${sourceBits.join(" · ")}` : ""}`;
 }
@@ -19786,7 +19937,7 @@ export function renderLearnReconcile(raw: Record<string, any>): string {
 }
 
 function learnUsage(): void {
-  console.log(`${invokedAs()} learn [--all|--plain|--json|--md] [--since 30d] [--sources claude,codex,gemini,opencode,aider]
+  console.log(`${invokedAs()} learn [--all|--plain|--json|--md] [--since 30d] [--sources claude,codex,gemini,opencode,aider,pi]
   shows where your agent's tokens go, and what to fix first
   default       interactive Setup Score + top findings
   --plain       short text; no animation or keyboard menu
@@ -20068,10 +20219,14 @@ function resolveCavememCommand(): { command: string; args: string[] } {
 // cavememRun shells to cavemem and returns its stdout. On failure it surfaces the
 // error honestly and exits — except in soft mode (the recall hook), where it
 // returns null so the hook can no-op without ever blocking the agent.
-function cavememRun(memArgs: string[], opts: { soft?: boolean } = {}): string | null {
+function cavememRun(memArgs: string[], opts: { soft?: boolean; stdin?: boolean } = {}): string | null {
   const { command, args: pre } = resolveCavememCommand();
   try {
-    return execFileSync(command, [...pre, ...memArgs], { encoding: "utf8", env: process.env });
+    return execFileSync(command, [...pre, ...memArgs], {
+      encoding: "utf8",
+      env: process.env,
+      stdio: [opts.stdin ? "inherit" : "pipe", "pipe", "pipe"],
+    });
   } catch (error) {
     const e = error as { stdout?: string; stderr?: string; status?: number; message?: string };
     if (opts.soft) return null;
@@ -20096,9 +20251,15 @@ function mem(rest: string[]) {
       // fall back to dropping flag-looking args (remember takes none) for
       // backward compatibility.
       const args = rest.slice(1);
+      // --stdin hands our stdin straight to cavemem, so the block reaches the
+      // store byte for byte and never passes through a shell command line.
+      if (args.length === 1 && args[0] === "--stdin") {
+        process.stdout.write(cavememRun(["remember", "--stdin"], { stdin: true }) ?? "");
+        return;
+      }
       const sep = args.indexOf("--");
       const text = (sep >= 0 ? args.slice(sep + 1) : args.filter((a) => !a.startsWith("--"))).join(" ");
-      if (!text) { console.error(`usage: ${invokedCommand("mem")} remember [--] <text>`); process.exit(2); }
+      if (!text) { console.error(`usage: ${invokedCommand("mem")} remember [--] <text> | --stdin`); process.exit(2); }
       process.stdout.write(cavememRun(["remember", text]) ?? "");
       return;
     }
@@ -20127,9 +20288,16 @@ function mem(rest: string[]) {
       // Same `--` end-of-options handling as remember: a replacement block that
       // opens with a `---` rule must survive verbatim instead of filtering empty.
       const rest2 = rest.slice(2);
+      // --stdin hands our stdin straight to cavemem, exactly as remember does,
+      // so a replacement bigger than one argv element (~128 KB on Linux,
+      // ~32 KB of whole command line on Windows) reaches the store at all.
+      if (id && rest2.length === 1 && rest2[0] === "--stdin") {
+        process.stdout.write(cavememRun(["supersede", id, "--stdin"], { stdin: true }) ?? "");
+        return;
+      }
       const sep = rest2.indexOf("--");
       const text = (sep >= 0 ? rest2.slice(sep + 1) : rest2.filter((a) => !a.startsWith("--"))).join(" ");
-      if (!id || !text) { console.error(`usage: ${invokedCommand("mem")} supersede <id> [--] <text>`); process.exit(2); }
+      if (!id || !text) { console.error(`usage: ${invokedCommand("mem")} supersede <id> [--] <text> | <id> --stdin`); process.exit(2); }
       process.stdout.write(cavememRun(["supersede", id, text]) ?? "");
       return;
     }
@@ -20171,6 +20339,7 @@ function memRecover(handle: string) {
 function memUsage() {
   console.log(`caveman mem — durable agent memory (cavemem)
   caveman mem remember <text>              store a memory
+  caveman mem remember --stdin             store a memory read from stdin, byte for byte
   caveman mem recall <query> [--limit N]   recall memories (lexical, conservative threshold)
   caveman mem supersede <id> <text>        replace a current fact; preserve history
   caveman mem history <id>                 show oldest-to-newest versions

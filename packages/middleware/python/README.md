@@ -10,13 +10,9 @@ Follow the [LangChain quickstart](https://docs.caveman.so/integrations/framework
 
 ```sh
 python -m pip install 'caveman-sdk==1.2.0' 'caveman-middleware[langchain]==1.0.0' 'langchain==1.4.1' 'langchain-core==1.6.3' 'langgraph==1.2.11'
-curl -fsSLo quickstart.py https://docs.caveman.so/examples/middleware/quickstart.py
-DEMO_MODE=record python quickstart.py
-DEMO_MODE=compress python quickstart.py
-DEMO_MODE=off python quickstart.py
 ```
 
-The default example makes no provider request. It runs a deterministic native model/tool loop against the real local runtime, checks compression and exact paginated recovery, and asserts that application history retains originals. The optional provider run is separately labeled and can incur charges.
+The framework guide above is the runnable walkthrough. A separate downloadable quickstart script is not published on the docs site.
 
 ## Choose an integration
 
@@ -89,6 +85,8 @@ Wrapping never raises for a version problem, even in strict mode. To fail fast a
 CI tests the oldest versions on Python 3.11 and the newest on Python 3.13, using `constraints/floor.txt` and `constraints/latest.txt`. It also runs the certified families on 3.12 and 3.14. Every lane tests the built wheel, installed. A nightly run installs each extra's newest releases with no constraints and opens an issue when one breaks an adapter. The extras stop at the next major version, so a new major is only tested once its range is widened.
 
 `[openai]` accepts openai 2.20 through 3.x. LiteLLM and CrewAI require `openai<3`, so `[openai,litellm]` or `[openai,crewai]` installs openai 2.x. The adapter supports 2.x, but you can't get openai 3.x in the same environment as those two frameworks. `[asgi]` has no dependencies; it works with any ASGI 3 server or framework.
+
+The `[litellm]` extra requires `filelock>=4.2.1` to exclude vulnerable lock-file and timeout implementations. LiteLLM releases that require `filelock<4` cannot satisfy this extra; pip selects an earlier compatible LiteLLM release until upstream permits patched filelock versions. This floor is published in the wheel metadata, not only applied to CI.
 
 ## Failures, scopes, and logging
 
